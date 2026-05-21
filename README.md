@@ -60,16 +60,18 @@ Provisioned via Terraform (`main.tf`):
 m5-06-deployment-strategies/
 ├── .github/
 │   └── workflows/
-│       ├── deploy.yml        # Deploy & Switch workflow
-│       └── rollback.yml      # Rollback workflow
+│       ├── deploy.yml              # Deploy & Switch workflow (tested)
+│       ├── rollback.yml            # Rollback workflow (tested)
+│       └── deploy-with-safe.yml    # Safe Deploy with Auto-Rollback (not tested)
 ├── app/
 │   ├── blue/
-│   │   └── index.html        # Blue environment app (v1.0.0)
+│   │   └── index.html              # Blue environment app (v1.0.0)
 │   └── green/
-│       └── index.html        # Green environment app (v2.0.0)
-├── screenshots/              # Lab evidence
-├── deployment.json           # Active environment state tracker
-├── main.tf                   # Terraform infrastructure
+│       └── index.html              # Green environment app (v2.0.0)
+├── screenshots/                    # Lab evidence
+├── canary-router.js                # CloudFront Function for canary routing (not tested)
+├── deployment.json                 # Active environment state tracker
+├── main.tf                         # Terraform infrastructure
 ├── variables.tf
 └── outputs.tf
 ```
@@ -190,6 +192,98 @@ The final state of `deployment.json` after the full lab cycle:
 | 2 | green | 2.0.0 | deploy-switch | 2026-05-21T09:40:28Z |
 | 3 | blue | 1.0.0 | rollback | 2026-05-21T09:44:15Z |
 
+---
+
+## Untested Extensions
+
+> **Note:** The resources and workflows in this section were written as extensions to the lab but **have not been executed or validated**. They are included here as design references only.
+
+### Safe Deploy with Auto-Rollback (`deploy-with-safe.yml`)
+
+An enhanced version of `deploy.yml` that adds an automatic rollback safety net. Instead of verifying the target environment *before* switching, it switches first and then runs a post-switch health check. If the health check fails, the workflow automatically reverts `deployment.json` to the previous environment without any manual intervention.
+
+**How it differs from `deploy.yml`:**
+
+| | `deploy.yml` | `deploy-with-safe.yml` |
+|---|---|---|
+| Health check timing | Before switch | After switch |
+| On failure | Aborts, no switch | Auto-reverts state |
+| Retries | None | 3 attempts with 5s delay |
+| Rollback trigger | Manual | Automatic |
+
+**Steps:**
+1. Determines active and target environments from `deployment.json`
+2. Uploads `app/<target>/index.html` to the target S3 bucket
+3. Updates `deployment.json` to flip the active environment
+4. Runs a post-switch health check with 3 retries (`continue-on-error: true`)
+5. If health check output is `healthy=false` → automatically rolls back `deployment.json` to the previous environment
+6. Commits the final state (either the successful switch or the auto-rollback)
+
+**Auto-rollback log entry example:**
+```json
+{
+  "environment": "blue",
+  "action": "auto-rollback",
+  "reason": "health-check-failed"
+}
+```
+
+### Canary Deployment (`canary-router.js` + CloudFront)
+
+A canary deployment pattern that gradually shifts a percentage of traffic to the green environment while keeping the majority on blue. This allows real-user testing of a new release before a full switch.
+
+**`canary-router.js`** — a CloudFront Function that runs on every viewer request:
+
+```js
+function handler(event) {
+  var weight = 10; // percentage to green
+  var rand = Math.random() * 100;
+  if (rand < weight) {
+    var request = event.request;
+    request.origin = { s3: { domainName: 'deploy-lab-green.s3.amazonaws.com' }};
+    return request;
+  }
+  return event.request;
+}
+```
+
+With `weight = 10`, approximately 10% of requests are routed to green; the remaining 90% stay on blue.
+
+**Terraform resources (in `main.tf`):**
+
+| Resource | Purpose |
+|---|---|
+| `aws_cloudfront_distribution.canary` | Distribution with both S3 buckets as origins |
+| `var.canary_weight` | Configurable traffic split percentage (0–100, default 10) |
+| `output.cloudfront_url` | CloudFront URL for the canary distribution |
+
+The CloudFront distribution is configured with a `blue-green` origin group and failover criteria on 5xx errors (500, 502, 503, 504), meaning CloudFront will automatically fall back to the secondary origin if the primary returns a server error.
+
+**Architecture (canary mode):**
+
+```
+                    ┌──────────────────────────┐
+User Request ──────►│  CloudFront Distribution  │
+                    │   (canary-router.js)       │
+                    └──────────┬───────────────-┘
+                               │
+               ┌───────────────┴───────────────┐
+            90%│                               │10%
+               ▼                               ▼
+      ┌────────────────┐             ┌────────────────┐
+      │  S3 (BLUE)     │             │  S3 (GREEN)    │
+      │  v1.0.0        │             │  v2.0.0        │
+      └────────────────┘             └────────────────┘
+```
+
+**Variable:**
+
+| Variable | Default | Description |
+|---|---|---|
+| `canary_weight` | `10` | Percentage of traffic routed to green (0–100) |
+
+---
+
 ## Key Concepts Demonstrated
 
 - **Blue/Green deployment** — two identical environments with instant switchover
@@ -198,3 +292,5 @@ The final state of `deployment.json` after the full lab cycle:
 - **Deployment state tracking** — `deployment.json` provides an auditable history of every deploy and rollback
 - **Infrastructure as Code** — all S3 resources provisioned and managed with Terraform
 - **CI/CD via GitHub Actions** — fully automated pipeline with `workflow_dispatch` triggers
+- **Auto-rollback safety net** *(designed, not tested)* — post-switch health check with automatic state reversion on failure
+- **Canary deployments** *(designed, not tested)* — CloudFront Function + origin group for gradual traffic splitting

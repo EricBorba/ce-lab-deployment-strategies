@@ -1,0 +1,101 @@
+name: Safe Deploy with Auto-Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to deploy"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_DEFAULT_REGION: us-east-1
+
+jobs:
+  deploy:
+    name: Deploy with Safety Net
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Determine environments
+        id: env
+        run: |
+          ACTIVE=$(jq -r '.active_environment' deployment.json)
+          TARGET=$( [ "$ACTIVE" = "blue" ] && echo "green" || echo "blue" )
+          echo "active=$ACTIVE" >> "$GITHUB_OUTPUT"
+          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy to target
+        run: |
+          TARGET="${{ steps.env.outputs.target }}"
+          BUCKET="deploy-lab-${TARGET}"
+          aws s3 cp "app/$TARGET/index.html" "s3://$BUCKET/index.html" \
+            --content-type "text/html"
+
+      - name: Switch active environment
+        run: |
+          TARGET="${{ steps.env.outputs.target }}"
+          VERSION="${{ github.event.inputs.version }}"
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          jq \
+            --arg env "$TARGET" \
+            --arg ver "$VERSION" \
+            --arg ts "$TIMESTAMP" \
+            --arg actor "${{ github.actor }}" \
+            '.active_environment = $env |
+             .last_deployed = $ts |
+             .deployed_by = $actor |
+             .version = $ver |
+             .history += [{"environment": $env, "version": $ver, "timestamp": $ts, "action": "deploy-switch"}]' \
+            deployment.json > deployment.tmp && mv deployment.tmp deployment.json
+
+      - name: Post-switch health check
+        id: healthcheck
+        continue-on-error: true
+        run: |
+          TARGET="${{ steps.env.outputs.target }}"
+          URL="http://deploy-lab-${TARGET}.s3-website-us-east-1.amazonaws.com"
+          RETRIES=3
+          for i in $(seq 1 $RETRIES); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL")
+            echo "Attempt $i: HTTP $STATUS"
+            [ "$STATUS" -eq 200 ] && echo "healthy=true" >> "$GITHUB_OUTPUT" && exit 0
+            sleep 5
+          done
+          echo "healthy=false" >> "$GITHUB_OUTPUT"
+          exit 1
+
+      - name: Auto-rollback on failure
+        if: steps.healthcheck.outputs.healthy == 'false'
+        run: |
+          echo "Health check failed — rolling back!"
+          PREVIOUS="${{ steps.env.outputs.active }}"
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          jq \
+            --arg env "$PREVIOUS" \
+            --arg ts "$TIMESTAMP" \
+            --arg actor "${{ github.actor }}" \
+            '.active_environment = $env |
+             .last_deployed = $ts |
+             .deployed_by = $actor |
+             .history += [{"environment": $env, "version": .version, "timestamp": $ts, "action": "auto-rollback", "reason": "health-check-failed"}]' \
+            deployment.json > deployment.tmp && mv deployment.tmp deployment.json
+
+          echo "Rolled back to $PREVIOUS"
+
+      - name: Commit state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add deployment.json
+          git commit -m "Deploy v${{ github.event.inputs.version }} — $(jq -r '.history[-1].action' deployment.json)"
+          git push
