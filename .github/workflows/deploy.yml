@@ -1,0 +1,106 @@
+name: Deploy & Switch
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag for this deployment"
+        required: true
+        default: "2.0.0"
+
+permissions:
+  contents: write
+
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_DEFAULT_REGION: us-east-1
+
+jobs:
+  deploy:
+    name: Deploy to Inactive Environment
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Determine target environment
+        id: env
+        run: |
+          ACTIVE=$(jq -r '.active_environment' deployment.json)
+          if [ "$ACTIVE" = "blue" ]; then
+            TARGET="green"
+          else
+            TARGET="blue"
+          fi
+          echo "active=$ACTIVE" >> "$GITHUB_OUTPUT"
+          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "Deploying to $TARGET (currently active: $ACTIVE)"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: latest
+          terraform_wrapper: false
+
+      - name: Get bucket name
+        id: bucket
+        run: |
+          terraform init -backend=false
+          TARGET="${{ steps.env.outputs.target }}"
+          BUCKET_NAME="deploy-lab-eric-borba-${TARGET}"
+          echo "name=$BUCKET_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy to target environment
+        run: |
+          TARGET="${{ steps.env.outputs.target }}"
+          BUCKET="${{ steps.bucket.outputs.name }}"
+          echo "Uploading app/$TARGET/index.html to s3://$BUCKET/"
+          aws s3 cp "app/$TARGET/index.html" "s3://$BUCKET/index.html" \
+            --content-type "text/html"
+
+      - name: Verify deployment
+        run: |
+          TARGET="${{ steps.env.outputs.target }}"
+          BUCKET="${{ steps.bucket.outputs.name }}"
+          URL="http://${BUCKET}.s3-website-us-east-1.amazonaws.com"
+          echo "Checking $URL ..."
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL")
+          if [ "$STATUS" -eq 200 ]; then
+            echo "Target environment is healthy (HTTP $STATUS)"
+          else
+            echo "Target environment returned HTTP $STATUS — aborting switch"
+            exit 1
+          fi
+
+      - name: Switch active environment
+        run: |
+          TARGET="${{ steps.env.outputs.target }}"
+          VERSION="${{ github.event.inputs.version }}"
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          jq \
+            --arg env "$TARGET" \
+            --arg ver "$VERSION" \
+            --arg ts "$TIMESTAMP" \
+            --arg actor "${{ github.actor }}" \
+            '.active_environment = $env |
+             .last_deployed = $ts |
+             .deployed_by = $actor |
+             .version = $ver |
+             .history += [{"environment": $env, "version": $ver, "timestamp": $ts, "action": "deploy-switch"}]' \
+            deployment.json > deployment.tmp && mv deployment.tmp deployment.json
+
+          echo "Switched active environment to $TARGET"
+          cat deployment.json
+
+      - name: Commit deployment state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add deployment.json
+          git commit -m "Deploy v${{ github.event.inputs.version }} to ${{ steps.env.outputs.target }}
+
+          Switched active environment from ${{ steps.env.outputs.active }} to ${{ steps.env.outputs.target }}"
+          git push

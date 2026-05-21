@@ -1,0 +1,14 @@
+{
+  "active_environment": "blue",
+  "last_deployed": "2026-02-26T10:00:00Z",
+  "deployed_by": "initial-setup",
+  "version": "1.0.0",
+  "history": [
+    {
+      "environment": "blue",
+      "version": "1.0.0",
+      "timestamp": "2026-02-26T10:00:00Z",
+      "action": "initial-deploy"
+    }
+  ]
+}

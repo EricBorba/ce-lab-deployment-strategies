@@ -1,0 +1,79 @@
+name: Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Reason for rollback"
+        required: true
+        default: "Production issue detected"
+
+permissions:
+  contents: write
+
+jobs:
+  rollback:
+    name: Rollback to Previous Environment
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Determine rollback target
+        id: env
+        run: |
+          ACTIVE=$(jq -r '.active_environment' deployment.json)
+          HISTORY_LEN=$(jq '.history | length' deployment.json)
+
+          if [ "$HISTORY_LEN" -lt 2 ]; then
+            echo "No previous deployment to roll back to."
+            exit 1
+          fi
+
+          if [ "$ACTIVE" = "blue" ]; then
+            ROLLBACK_TO="green"
+          else
+            ROLLBACK_TO="blue"
+          fi
+
+          PREV_VERSION=$(jq -r '.history[-2].version // "unknown"' deployment.json)
+
+          echo "active=$ACTIVE" >> "$GITHUB_OUTPUT"
+          echo "rollback_to=$ROLLBACK_TO" >> "$GITHUB_OUTPUT"
+          echo "prev_version=$PREV_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Rolling back from $ACTIVE to $ROLLBACK_TO (version $PREV_VERSION)"
+
+      - name: Switch active environment
+        run: |
+          ROLLBACK_TO="${{ steps.env.outputs.rollback_to }}"
+          PREV_VERSION="${{ steps.env.outputs.prev_version }}"
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          REASON="${{ github.event.inputs.reason }}"
+
+          jq \
+            --arg env "$ROLLBACK_TO" \
+            --arg ver "$PREV_VERSION" \
+            --arg ts "$TIMESTAMP" \
+            --arg actor "${{ github.actor }}" \
+            --arg reason "$REASON" \
+            '.active_environment = $env |
+             .last_deployed = $ts |
+             .deployed_by = $actor |
+             .version = $ver |
+             .history += [{"environment": $env, "version": $ver, "timestamp": $ts, "action": "rollback", "reason": $reason}]' \
+            deployment.json > deployment.tmp && mv deployment.tmp deployment.json
+
+          echo "Rolled back to $ROLLBACK_TO"
+          cat deployment.json
+
+      - name: Commit rollback state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add deployment.json
+          git commit -m "Rollback to ${{ steps.env.outputs.rollback_to }} (v${{ steps.env.outputs.prev_version }})
+
+          Reason: ${{ github.event.inputs.reason }}
+          Rolled back from ${{ steps.env.outputs.active }} to ${{ steps.env.outputs.rollback_to }}"
+          git push
